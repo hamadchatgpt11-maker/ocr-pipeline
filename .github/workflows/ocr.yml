@@ -2,14 +2,17 @@ name: OCR Pipeline
 
 on:
   schedule:
-    - cron: '*/15 * * * *'   # har 15 minute mein khud chalega
-  workflow_dispatch:          # manually bhi "Run workflow" button se chala sakte hain
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ocr-pipeline
+  cancel-in-progress: false
 
 jobs:
   run-ocr:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
-
+    timeout-minutes: 340
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -17,13 +20,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install pymupdf requests google-auth google-api-python-client
-
-      - name: Write service account key
-        run: echo '${{ secrets.GDRIVE_SA_KEY }}' > service_account.json
+        run: pip install pymupdf google-api-python-client google-auth requests
 
       - name: Run pipeline
         run: python ocr_pipeline_gha.py
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
