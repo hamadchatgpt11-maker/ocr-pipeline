@@ -1,148 +1,228 @@
+"""
+OCR pipeline for GitHub Actions (OAuth2 refresh-token auth, Google Drive API v3).
+
+Flow (one book per run):
+  1. Read links.txt from the PDFTOOCR folder in Google Drive
+  2. Pick the first book that is not finished
+  3. Download the PDF, render pages to JPEG (200 DPI, quality 85)
+  4. Upload the images to OCR_Book_<name> in PDFTOOCR
+  5. Signal Apps Script (?action=start&book=<name>)
+  6. Write triggered.flag into the book folder
+
+Required env vars (GitHub secrets):
+  GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN
+"""
+import io
 import os
 import re
-import io
+import sys
+import tempfile
+from urllib.parse import unquote, urlparse, quote
+
 import requests
-import fitz
-from pathlib import Path
 
-from google.oauth2 import service_account
+try:
+    import pymupdf as fitz
+except ImportError:  # older PyMuPDF
+    import fitz
+
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-GOOGLE_SCRIPT_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbz4BT3ZC2Pnv2IMLLnZ4n4fY-9yVy4zSNhxTE8UsRx6Qc75lwDgXfIH7dEke27xAn94Jw/exec"
-SCOPES = ['https://www.googleapis.com/auth/drive']
-SERVICE_ACCOUNT_FILE = 'service_account.json'
+# ----------------------------- CONFIG ---------------------------------
+APPS_SCRIPT_URL = os.environ.get(
+    "APPS_SCRIPT_URL",
+    "https://script.google.com/macros/s/"
+    "AKfycbz4BT3ZC2Pnv2IMLLnZ4n4fY-9yVy4zSNhxTE8UsRx6Qc75lwDgXfIH7dEke27xAn94Jw/exec",
+)
+ROOT_FOLDER_NAME = "PDFTOOCR"
+LINKS_FILE_NAME = "links.txt"
+BOOK_FOLDER_PREFIX = "OCR_Book_"
+FLAG_NAME = "triggered.flag"
+DPI = 200
+JPEG_QUALITY = 85
+FOLDER_MIME = "application/vnd.google-apps.folder"
+# ----------------------------------------------------------------------
 
-creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-drive = build('drive', 'v3', credentials=creds)
+
+def get_drive():
+    creds = Credentials(
+        token=None,
+        refresh_token=os.environ["GDRIVE_REFRESH_TOKEN"].strip(),
+        client_id=os.environ["GDRIVE_CLIENT_ID"].strip(),
+        client_secret=os.environ["GDRIVE_CLIENT_SECRET"].strip(),
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=["https://www.googleapis.com/auth/drive"],
+    )
+    try:
+        creds.refresh(Request())
+    except RefreshError as e:
+        print("ERROR: could not refresh Google token:", e)
+        print("If this says invalid_grant, the refresh token expired (Testing mode = 7 days).")
+        print("Get a new refresh token from OAuth Playground and update GDRIVE_REFRESH_TOKEN.")
+        sys.exit(1)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def find_folder(name, parent_id=None):
-    q = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+# --------------------------- Drive helpers -----------------------------
+def q_escape(s):
+    return s.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def find_one(drive, name, parent_id=None, folder=False):
+    q = f"name='{q_escape(name)}' and trashed=false"
+    if folder:
+        q += f" and mimeType='{FOLDER_MIME}'"
     if parent_id:
         q += f" and '{parent_id}' in parents"
-    res = drive.files().list(q=q, fields="files(id, name)").execute()
-    files = res.get('files', [])
-    return files[0]['id'] if files else None
+    res = drive.files().list(q=q, fields="files(id,name)", pageSize=10).execute(num_retries=5)
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
 
 
-def create_folder(name, parent_id=None):
-    metadata = {'name': name, 'mimeType': 'application/vnd.google-apps.folder'}
-    if parent_id:
-        metadata['parents'] = [parent_id]
-    return drive.files().create(body=metadata, fields='id').execute()['id']
+def create_folder(drive, name, parent_id):
+    body = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
+    return drive.files().create(body=body, fields="id").execute(num_retries=5)["id"]
 
 
-def get_or_create_folder(name, parent_id=None):
-    fid = find_folder(name, parent_id)
-    return fid if fid else create_folder(name, parent_id)
+def list_children(drive, parent_id):
+    items, token = [], None
+    while True:
+        res = drive.files().list(
+            q=f"'{parent_id}' in parents and trashed=false",
+            fields="nextPageToken, files(id,name,mimeType)",
+            pageSize=1000,
+            pageToken=token,
+        ).execute(num_retries=5)
+        items.extend(res.get("files", []))
+        token = res.get("nextPageToken")
+        if not token:
+            return items
 
 
-def list_files(folder_id):
-    q = f"'{folder_id}' in parents and trashed=false"
-    res = drive.files().list(q=q, fields="files(id, name)", pageSize=1000).execute()
-    return res.get('files', [])
+def upload_bytes(drive, folder_id, name, data, mime):
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
+    body = {"name": name, "parents": [folder_id]}
+    return drive.files().create(body=body, media_body=media, fields="id").execute(num_retries=5)
 
 
-def download_text(file_id):
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, drive.files().get_media(fileId=file_id))
+def upload_text(drive, folder_id, name, text):
+    return upload_bytes(drive, folder_id, name, text.encode("utf-8"), "text/plain")
+
+
+def read_text(drive, file_id):
+    request = drive.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
     done = False
     while not done:
-        _, done = downloader.next_chunk()
-    return fh.getvalue().decode('utf-8')
+        _, done = downloader.next_chunk(num_retries=5)
+    return buf.getvalue().decode("utf-8-sig", errors="replace")
 
 
-def upload_text(folder_id, name, content, existing_file_id=None):
-    media = MediaIoBaseUpload(io.BytesIO(content.encode('utf-8')), mimetype='text/plain')
-    if existing_file_id:
-        drive.files().update(fileId=existing_file_id, media_body=media).execute()
-    else:
-        drive.files().create(body={'name': name, 'parents': [folder_id]}, media_body=media, fields='id').execute()
+# --------------------------- Book helpers ------------------------------
+def parse_links(text):
+    return [ln.strip() for ln in text.splitlines() if ln.strip().lower().startswith("http")]
 
 
-def upload_image(folder_id, local_path, name):
-    media = MediaFileUpload(local_path, mimetype='image/jpeg')
-    drive.files().create(body={'name': name, 'parents': [folder_id]}, media_body=media, fields='id').execute()
+def book_name_from_url(url):
+    stem = os.path.splitext(unquote(os.path.basename(urlparse(url).path)))[0]
+    return re.sub(r"[^A-Za-z0-9_\-]+", "_", stem).strip("_") or "book"
+
+
+def book_state(drive, root_names, name):
+    """Returns (state, folder_id): new | partial | running | done"""
+    folder_id = find_one(drive, BOOK_FOLDER_PREFIX + name, parent_id=None, folder=True)
+    if not folder_id:
+        return "new", None
+    names = [f["name"] for f in list_children(drive, folder_id)]
+    finished = any("completed" in n.lower() for n in names) or any(
+        n.lower().endswith(".docx") and name.lower() in n.lower() for n in root_names
+    )
+    if finished:
+        return "done", folder_id
+    if FLAG_NAME in names:
+        return "running", folder_id
+    return "partial", folder_id
+
+
+def download_pdf(url, path):
+    print("Downloading PDF:", url)
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+    print("PDF size: %.1f MB" % (os.path.getsize(path) / 1e6))
+
+
+def process_book(drive, root_id, url, name, folder_id):
+    if not folder_id:
+        folder_id = create_folder(drive, BOOK_FOLDER_PREFIX + name, root_id)
+    existing = {f["name"] for f in list_children(drive, folder_id)}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_path = os.path.join(tmp, "book.pdf")
+        download_pdf(url, pdf_path)
+        doc = fitz.open(pdf_path)
+        total = len(doc)
+        print("Pages:", total)
+        zoom = DPI / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+        for i in range(total):
+            img_name = "page_%04d.jpg" % (i + 1)
+            if img_name in existing:
+                continue
+            pix = doc[i].get_pixmap(matrix=matrix, colorspace=fitz.csRGB)
+            data = pix.tobytes("jpeg", jpg_quality=JPEG_QUALITY)
+            upload_bytes(drive, folder_id, img_name, data, "image/jpeg")
+            if (i + 1) % 10 == 0 or i + 1 == total:
+                print("Uploaded %d/%d" % (i + 1, total))
+        doc.close()
+
+    signal_url = "%s?action=start&book=%s" % (APPS_SCRIPT_URL, quote(name))
+    print("Signalling Apps Script...")
+    resp = requests.get(signal_url, timeout=180)
+    print("Apps Script reply:", resp.status_code, resp.text[:300])
+    resp.raise_for_status()
+
+    upload_text(drive, folder_id, FLAG_NAME, "started")
+    print("Done for this run:", name)
 
 
 def run_once():
-    main_folder_id = get_or_create_folder("PDFTOOCR")
-    files = list_files(main_folder_id)
+    drive = get_drive()
 
-    links_file = next((f for f in files if f['name'] == 'links.txt'), None)
-    if not links_file:
-        upload_text(main_folder_id, "links.txt", "# یہاں ہر لائن میں ایک PDF کا آن لائن لنک (URL) پیسٹ کریں\n")
-        print("📁 links.txt نہیں ملی، بنا دی گئی۔")
+    root_id = find_one(drive, ROOT_FOLDER_NAME, folder=True)
+    if not root_id:
+        print("ERROR: folder '%s' not found in Drive" % ROOT_FOLDER_NAME)
+        sys.exit(1)
+
+    links_id = find_one(drive, LINKS_FILE_NAME, parent_id=root_id)
+    if not links_id:
+        print("ERROR: %s not found inside %s" % (LINKS_FILE_NAME, ROOT_FOLDER_NAME))
+        sys.exit(1)
+
+    links = parse_links(read_text(drive, links_id))
+    print("Links found:", len(links))
+    root_names = [f["name"] for f in list_children(drive, root_id)]
+
+    for url in links:
+        name = book_name_from_url(url)
+        state, folder_id = book_state(drive, root_names, name)
+        print("Book %s -> %s" % (name, state))
+        if state == "done":
+            continue
+        if state == "running":
+            print("Previous book still being OCR'd, waiting for next run.")
+            return
+        process_book(drive, root_id, url, name, folder_id)
         return
 
-    content = download_text(links_file['id'])
-    found_urls = re.findall(r'https?://[^\s]+', content)
-    pdf_urls = [u for u in found_urls if not u.startswith('#')]
-
-    if not pdf_urls:
-        print("⏳ links.txt فی الحال خالی ہے۔")
-        return
-
-    pdf_url = pdf_urls[0]
-    raw_name = pdf_url.split('/')[-1].split('?')[0]
-    book_name = Path(raw_name).stem or "book_item_auto"
-    book_folder_name = f"OCR_Book_{book_name}"
-
-    print(f"📖 کتاب کا لنک: {pdf_url}")
-
-    # ✅ Step 1: check kya OCR pehle hi complete ho chuka hai (docx PDFTOOCR mein maujood hai)
-    docx_done = any(f['name'].endswith('.docx') and book_name in f['name'] for f in list_files(main_folder_id))
-    if docx_done:
-        print(f"🎉 '{book_name}' مکمل ہو چکی ہے — لنک ہٹایا جا رہا ہے۔")
-        upload_text(main_folder_id, "links.txt", content.replace(pdf_url, ""), existing_file_id=links_file['id'])
-        return
-
-    # ✅ Step 2: book folder + images
-    book_folder_id = find_folder(book_folder_name, main_folder_id)
-    if not book_folder_id:
-        book_folder_id = create_folder(book_folder_name, main_folder_id)
-
-    book_files = list_files(book_folder_id)
-    existing_images = [f for f in book_files if f['name'].lower().endswith(('.jpg', '.jpeg', '.png'))]
-
-    if not existing_images:
-        print(f"📥 کتاب ڈاؤن لوڈ ہو رہی ہے: {pdf_url}")
-        temp_pdf_path = f"/tmp/{book_name}.pdf"
-        r = requests.get(pdf_url, stream=True)
-        r.raise_for_status()
-        with open(temp_pdf_path, "wb") as f:
-            for chunk in r.iter_content(8192):
-                f.write(chunk)
-
-        doc = fitz.open(temp_pdf_path)
-        total_pages = len(doc)
-        print(f"📄 کل صفحات: {total_pages}")
-
-        for i in range(total_pages):
-            pix = doc[i].get_pixmap(dpi=200)
-            local_img = f"/tmp/page_{i + 1}.jpg"
-            pix.save(local_img, jpg_quality=85)
-            upload_image(book_folder_id, local_img, f"page_{i + 1}.jpg")
-            os.remove(local_img)
-            if (i + 1) % 50 == 0:
-                print(f"   ...{i + 1}/{total_pages} اپلوڈ ہو چکیں")
-
-        os.remove(temp_pdf_path)
-        print("✅ تمام تصاویر اپلوڈ ہو گئیں۔")
-        book_files = list_files(book_folder_id)
-
-    # ✅ Step 3: agar abhi tak trigger nahi hua to trigger karo
-    already_triggered = any(f['name'] == 'triggered.flag' for f in book_files)
-
-    if not already_triggered:
-        print("🔄 گوگل اسکرپٹ کو سگنل بھیجا جا رہا ہے...")
-        trigger_url = f"{GOOGLE_SCRIPT_WEB_APP_URL}?action=start&book={book_name}"
-        res = requests.get(trigger_url, timeout=60)
-        print("📡 جواب:", res.text)
-        upload_text(book_folder_id, "triggered.flag", "started")
-    else:
-        print(f"⏳ '{book_name}' کا OCR پہلے سے چل رہا ہے — اگلی run میں دوبارہ چیک ہوگا۔")
+    print("Nothing to do: all books are finished.")
 
 
 if __name__ == "__main__":
