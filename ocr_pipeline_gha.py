@@ -42,6 +42,7 @@ ROOT_FOLDER_NAME = "PDFTOOCR"
 LINKS_FILE_NAME = "links.txt"
 BOOK_FOLDER_PREFIX = "OCR_Book_"
 FLAG_NAME = "triggered.flag"
+OUTPUT_FOLDER_NAME = "Output Files"   # finished .docx files go here
 DPI = 200
 JPEG_QUALITY = 85
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -209,6 +210,10 @@ def run_once():
     links = parse_links(read_text(drive, links_id))
     print("Links found:", len(links))
     root_names = [f["name"] for f in list_children(drive, root_id)]
+    # finished .docx files may live in PDFTOOCR itself or in the "Output Files" subfolder
+    out_id = find_one(drive, OUTPUT_FOLDER_NAME, parent_id=root_id, folder=True)
+    if out_id:
+        root_names += [f["name"] for f in list_children(drive, out_id)]
 
     for url in links:
         name = book_name_from_url(url)
