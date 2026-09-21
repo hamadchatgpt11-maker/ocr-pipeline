@@ -8,6 +8,7 @@ Flow (one book per run):
   4. Upload the images to OCR_Book_<name> in PDFTOOCR
   5. Signal Apps Script (?action=start&book=<name>)
   6. Write triggered.flag into the book folder
+  7. Once .docx output is found -> remove that link from links.txt
 
 Required env vars (GitHub secrets):
   GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN
@@ -114,6 +115,11 @@ def upload_text(drive, folder_id, name, text):
     return upload_bytes(drive, folder_id, name, text.encode("utf-8"), "text/plain")
 
 
+def update_text(drive, file_id, text):
+    media = MediaIoBaseUpload(io.BytesIO(text.encode("utf-8")), mimetype="text/plain", resumable=False)
+    return drive.files().update(fileId=file_id, media_body=media).execute(num_retries=5)
+
+
 def read_text(drive, file_id):
     request = drive.files().get_media(fileId=file_id)
     buf = io.BytesIO()
@@ -129,24 +135,39 @@ def parse_links(text):
     return [ln.strip() for ln in text.splitlines() if ln.strip().lower().startswith("http")]
 
 
+def remove_link(drive, file_id, raw_text, url_to_remove):
+    lines = raw_text.splitlines()
+    new_lines = [ln for ln in lines if ln.strip() != url_to_remove.strip()]
+    new_text = "\n".join(new_lines) + ("\n" if new_lines else "")
+    update_text(drive, file_id, new_text)
+
+
 def book_name_from_url(url):
     stem = os.path.splitext(unquote(os.path.basename(urlparse(url).path)))[0]
     return re.sub(r"[^A-Za-z0-9_\-]+", "_", stem).strip("_") or "book"
 
 
 def book_state(drive, root_names, name):
-    """Returns (state, folder_id): new | partial | running | done"""
-    folder_id = find_one(drive, BOOK_FOLDER_PREFIX + name, parent_id=None, folder=True)
-    if not folder_id:
-        return "new", None
-    names = [f["name"] for f in list_children(drive, folder_id)]
-    finished = any("completed" in n.lower() for n in names) or any(
+    """Returns (state, folder_id): new | partial | running | done
+    ✅ FIX: pehle .docx (finished) check hota hai, folder existence check ke pehle —
+    warna book-folder delete hone ke baad ye ghalti se 'new' samajh leta tha."""
+    finished = any(
         n.lower().endswith(".docx") and name.lower() in n.lower() for n in root_names
     )
     if finished:
+        return "done", None
+
+    folder_id = find_one(drive, BOOK_FOLDER_PREFIX + name, parent_id=None, folder=True)
+    if not folder_id:
+        return "new", None
+
+    names = [f["name"] for f in list_children(drive, folder_id)]
+    if any("completed" in n.lower() for n in names):
         return "done", folder_id
+
     if FLAG_NAME in names:
         return "running", folder_id
+
     return "partial", folder_id
 
 
@@ -207,10 +228,11 @@ def run_once():
         print("ERROR: %s not found inside %s" % (LINKS_FILE_NAME, ROOT_FOLDER_NAME))
         sys.exit(1)
 
-    links = parse_links(read_text(drive, links_id))
+    raw_text = read_text(drive, links_id)
+    links = parse_links(raw_text)
     print("Links found:", len(links))
+
     root_names = [f["name"] for f in list_children(drive, root_id)]
-    # finished .docx files may live in PDFTOOCR itself or in the "Output Files" subfolder
     out_id = find_one(drive, OUTPUT_FOLDER_NAME, parent_id=root_id, folder=True)
     if out_id:
         root_names += [f["name"] for f in list_children(drive, out_id)]
@@ -219,11 +241,16 @@ def run_once():
         name = book_name_from_url(url)
         state, folder_id = book_state(drive, root_names, name)
         print("Book %s -> %s" % (name, state))
+
         if state == "done":
+            print("Book already finished — links.txt se link hataya ja raha hai")
+            remove_link(drive, links_id, raw_text, url)
             continue
+
         if state == "running":
             print("Previous book still being OCR'd, waiting for next run.")
             return
+
         process_book(drive, root_id, url, name, folder_id)
         return
 
