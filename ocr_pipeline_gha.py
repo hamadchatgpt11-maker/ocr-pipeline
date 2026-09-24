@@ -8,20 +8,27 @@ Fully autonomous flow (one book per run, safe to run on a schedule forever):
   4. Upload the images to OCR_Book_<name> in PDFTOOCR
   5. Mark the book "in progress" with a ROOT-level marker file
      (this marker does NOT live inside OCR_Book_<name>, so it survives
-     even if the Apps Script deletes that folder once OCR finishes)
+     even if the Apps Script ever cleans that folder up)
   6. Signal Apps Script (?action=start&book=<name>)
   7. On a later run, once the finished .docx is found in Drive ->
      remove the in-progress marker AND remove that link from links.txt
 
-Why the marker lives at the root:
-  The Apps Script deletes OCR_Book_<name> as soon as OCR completes.
-  If "is this book still running?" were judged by that folder's
-  existence, a run that happens to execute in the gap between
-  "folder deleted" and "docx saved" would wrongly conclude the book
-  was never started, and would re-download and re-OCR it from
-  scratch. The root-level marker is untouched by that cleanup, so
-  the book is correctly treated as "still running" until its .docx
-  actually shows up.
+Where the finished .docx is looked for:
+  Apps Script now saves the final .docx INSIDE the book's own
+  OCR_Book_<name> folder (alongside a completed.txt marker), not at
+  the PDFTOOCR root. So "done" is detected by checking, in order:
+    a) any .docx at the PDFTOOCR root (or Output Files folder) whose
+       name matches the book — covers older books exported the old way
+    b) a .docx or completed.txt/completed* file inside OCR_Book_<name>
+       itself — the current, normal case
+
+Why the in-progress marker lives at the root:
+  Keeping it outside OCR_Book_<name> means it survives no matter what
+  Apps Script does to that folder while OCR is running, so a run that
+  happens to execute mid-cleanup can't wrongly conclude the book was
+  never started and re-download/re-OCR it from scratch. The book is
+  correctly treated as "still running" until its .docx actually shows
+  up (per the check above).
 
 Required env vars (GitHub secrets):
   GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN
@@ -56,7 +63,7 @@ APPS_SCRIPT_URL = os.environ.get(
 ROOT_FOLDER_NAME = "PDFTOOCR"
 LINKS_FILE_NAME = "links.txt"
 BOOK_FOLDER_PREFIX = "OCR_Book_"
-OUTPUT_FOLDER_NAME = "Output Files"        # finished .docx files may live here
+OUTPUT_FOLDER_NAME = "Output Files"        # finished .docx files may (also) live here
 INPROGRESS_PREFIX = "INPROGRESS_"          # root-level marker, e.g. INPROGRESS_MAQAM_E_MAHFOOZ.flag
 INPROGRESS_SUFFIX = ".flag"
 STALE_AFTER_HOURS = 6                      # if a marker is older than this with no .docx yet, retry
@@ -176,24 +183,40 @@ def parse_drive_time(ts):
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
-def book_state(name, root_files):
+def book_finished_in_folder(drive, root_id, name):
+    """Check INSIDE OCR_Book_<name> for a .docx or a completed marker —
+    this is where Export.gs now saves the final output."""
+    folder_id = find_one(drive, BOOK_FOLDER_PREFIX + name, parent_id=root_id, folder=True)
+    if not folder_id:
+        return False
+    book_files = list_children(drive, folder_id)
+    return any(
+        f["name"].lower().endswith(".docx") or "completed" in f["name"].lower()
+        for f in book_files
+    )
+
+
+def book_state(drive, root_id, name, root_files):
     """
-    Decide what to do with a book using ONLY root-level Drive listing
-    (root_files: list of {name, mimeType, modifiedTime} in PDFTOOCR,
-    already merged with Output Files if that folder exists).
+    Decide what to do with a book.
 
     Returns one of: "done", "running", "stale", "new"
-    - done:    a finished .docx exists -> remove link, clean up marker
+    - done:    a finished .docx (or completed marker) exists, either at
+               the PDFTOOCR root / Output Files (older books), or inside
+               the book's own OCR_Book_<name> folder (current setup)
+               -> remove link, clean up marker
     - running: an INPROGRESS marker exists and is fresh -> skip this run
     - stale:   an INPROGRESS marker exists but is too old -> retry
     - new:     nothing exists yet -> start processing
     """
     nname = norm(name)
 
-    finished = any(
+    finished_at_root = any(
         f["name"].lower().endswith(".docx") and nname in norm(f["name"])
         for f in root_files
     )
+    finished = finished_at_root or book_finished_in_folder(drive, root_id, name)
+
     if finished:
         return "done"
 
@@ -223,7 +246,7 @@ def download_pdf(url, path):
 
 def process_book(drive, root_id, url, name):
     """Download + upload images, write the root in-progress marker, signal Apps Script."""
-    folder_id = find_one(drive, BOOK_FOLDER_PREFIX + name, parent_id=None, folder=True)
+    folder_id = find_one(drive, BOOK_FOLDER_PREFIX + name, parent_id=root_id, folder=True)
     if not folder_id:
         folder_id = create_folder(drive, BOOK_FOLDER_PREFIX + name, root_id)
     existing = {f["name"] for f in list_children(drive, folder_id)}
@@ -293,7 +316,7 @@ def run_once():
 
     for url in links:
         name = book_name_from_url(url)
-        state = book_state(name, root_files)
+        state = book_state(drive, root_id, name, root_files)
         print("Book %s -> %s" % (name, state))
 
         if state == "done":
